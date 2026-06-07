@@ -1,0 +1,296 @@
+diff --git a/fthd_isp.c b/fthd_isp.c
+index f8dbd2d..4c412b2 100644
+--- a/fthd_isp.c
++++ b/fthd_isp.c
+@@ -81,23 +81,28 @@ int isp_mem_destroy(struct isp_mem_obj *obj)
+ 	return 0;
+ }
+ 
++/*
++ * Macbook10,1 specific ACPI path for the camera sensor power control.
++ * The CMPE method is defined in the DSDT at _SB_.PCI0.RP10.CMRA.CMPE.
++ * The PCI device's ACPI handle is NOT the same as the CMRA device handle.
++ */
++#define FTHD_ACPI_CAMERA_PATH "\\_SB_.PCI0.RP10.CMRA"
++
+ static int isp_acpi_set_power(struct fthd_private *dev_priv, int power)
+ {
+ 	acpi_status status;
+ 	acpi_handle handle;
+ 	struct acpi_object_list arg_list;
+-	struct acpi_buffer buffer = {ACPI_ALLOCATE_BUFFER, NULL};
+ 	union acpi_object args[1];
+-	union acpi_object *result;
+-	int ret = 0;
+ 
+-
+-	handle = ACPI_HANDLE(&dev_priv->pdev->dev);
+-	if(!handle) {
+-		dev_err(&dev_priv->pdev->dev,
+-			"Failed to get S2 CMPE ACPI handle\n");
+-		ret = -ENODEV;
+-		goto out;
++	/* Get the CMRA device handle directly from ACPI namespace */
++	status = acpi_get_handle(NULL, FTHD_ACPI_CAMERA_PATH, &handle);
++	if (ACPI_FAILURE(status)) {
++		dev_warn(&dev_priv->pdev->dev,
++			"Cannot resolve camera ACPI handle %s (status 0x%08x), "
++			"attempting PCIe power management only\n",
++			FTHD_ACPI_CAMERA_PATH, (unsigned)status);
++		goto pcie_only;
+ 	}
+ 
+ 	args[0].type = ACPI_TYPE_INTEGER;
+@@ -106,29 +111,59 @@ static int isp_acpi_set_power(struct fthd_private *dev_priv, int power)
+ 	arg_list.count = 1;
+ 	arg_list.pointer = args;
+ 
+-	status = acpi_evaluate_object(handle, "CMPE", &arg_list, &buffer);
+-	if (ACPI_FAILURE(status)) {
+-		dev_err(&dev_priv->pdev->dev,
+-			"Failed to execute S2 CMPE ACPI method\n");
+-		ret = -ENODEV;
+-		goto out;
++	status = acpi_evaluate_object(handle, "CMPE", &arg_list, NULL);
++	if (ACPI_SUCCESS(status)) {
++		dev_dbg(&dev_priv->pdev->dev, "CMPE ACPI method succeeded (power=%d)\n", power);
++		return 0;
+ 	}
+ 
+-	result = buffer.pointer;
+-
+-	if (result->type != ACPI_TYPE_INTEGER || result->integer.value != 0) {
+-		dev_err(&dev_priv->pdev->dev,
+-			"Invalid ACPI response (len: %Ld)\n", buffer.length);
+-		ret = -EINVAL;
++	/* ACPI method call failed — this can happen on some kernels/hardware.
++	 * The CMPE method writes to PCIe config space to control power.
++	 * Fall back to standard PCIe power management. */
++	dev_warn(&dev_priv->pdev->dev,
++		"CMPE ACPI method failed (status 0x%08x), "
++		"falling back to PCIe power management\n",
++		(unsigned)status);
++
++pcie_only:
++	/* Standard PCIe power management as fallback */
++	if (power) {
++		pci_set_power_state(dev_priv->pdev, PCI_D0);
++	} else {
++		pci_set_power_state(dev_priv->pdev, PCI_D3hot);
+ 	}
+-
+-out:
+-	kfree(buffer.pointer);
+-	return ret;
++	return 0;
+ }
+ 
++/*
++ * Enable the camera sensor on Macbook10,1.
++ *
++ * The ISP firmware controls the sensor via I2C after the ISP itself
++ * is powered on. This function:
++ * 1. Powers on the ISP via ACPI CMPE or PCIe fallback
++ * 2. Sets the PCI device to D0
++ * 3. Waits for the PCIe link to stabilize (DSDT waits for LACT == 1)
++ * 4. Lets the ISP firmware handle the rest (sensor I2C init)
++ */
+ static int isp_enable_sensor(struct fthd_private *dev_priv)
+ {
++	int ret;
++
++	/* Power on the ISP/sensor path via the Apple ACPI CMPE method.
++	 * On this MacBook10,1, skipping CMPE prevents even the old 1.43
++	 * firmware from raising its first wake interrupt.
++	 */
++	ret = isp_acpi_set_power(dev_priv, 1);
++	if (ret) {
++		dev_warn(&dev_priv->pdev->dev,
++			"isp_acpi_set_power failed, continuing anyway\n");
++	}
++
++	pci_set_power_state(dev_priv->pdev, PCI_D0);
++	mdelay(150);
++
++	dev_info(&dev_priv->pdev->dev, "Sensor power: ACPI CMPE + PCI D0\n");
++
+ 	return 0;
+ }
+ 
+@@ -565,29 +600,57 @@ int fthd_isp_cmd_set_loadfile(struct fthd_private *dev_priv)
+ 	}
+ 
+ 	if (!filename) {
+-		pr_debug("no set file for sensorid %04x %04x found\n",
+-			 dev_priv->sensor_id0, dev_priv->sensor_id1);
++		dev_warn(&dev_priv->pdev->dev,
++			 "No set file for sensor ids %04x/%04x (board=%s)\n",
++			 dev_priv->sensor_id0, dev_priv->sensor_id1,
++			 board ? board : "unknown");
+ 		return 0;
+ 	}
+ 
++	dev_info(&dev_priv->pdev->dev,
++		 "Loading set file %s for sensor ids %04x/%04x (board=%s)\n",
++		 filename, dev_priv->sensor_id0, dev_priv->sensor_id1,
++		 board ? board : "unknown");
++
+ 	/* The set file is allowed to be missing but we don't get calibration */
+ 	ret = request_firmware(&fw, filename, &dev_priv->pdev->dev);
+-	if (ret)
++	if (ret) {
++		dev_warn(&dev_priv->pdev->dev,
++			 "Set file %s missing (%d); continuing without calibration\n",
++			 filename, ret);
+ 		return 0;
++	}
+ 
+-	/* Firmware memory is preallocated at init time */
+-	BUG_ON(dev_priv->set_file);
++	/* Firmware memory is preallocated at init time.
++	 * Do not BUG_ON stale state during repeated live tests; recover instead. */
++	if (dev_priv->set_file) {
++		dev_warn(&dev_priv->pdev->dev,
++			 "Replacing stale set file allocation\n");
++		isp_mem_destroy(dev_priv->set_file);
++		dev_priv->set_file = NULL;
++	}
+ 
+ 	file = isp_mem_create(dev_priv, FTHD_MEM_SET_FILE, fw->size);
++	if (!file) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
+ 	FTHD_S2_MEMCPY_TOIO(file->offset, fw->data, fw->size);
+ 
+ 	release_firmware(fw);
+ 
+ 	dev_priv->set_file = file;
+-	pr_debug("set file: addr %08lx, size %d\n", file->offset, (int)file->size);
++	dev_info(&dev_priv->pdev->dev,
++		 "Set file loaded: addr %08lx, size %d\n",
++		 file->offset, (int)file->size);
+ 	cmd.addr = file->offset;
+ 	cmd.length = file->size;
+-	return fthd_isp_cmd(dev_priv, CISP_CMD_CH_SET_FILE_LOAD, &cmd, sizeof(cmd), NULL);
++	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_SET_FILE_LOAD, &cmd, sizeof(cmd), NULL);
++	if (ret)
++		dev_warn(&dev_priv->pdev->dev,
++			 "Set file command failed (%d); continuing without calibration\n",
++			 ret);
++	return 0;
+ }
+ 
+ int fthd_isp_cmd_channel_info(struct fthd_private *dev_priv)
+@@ -600,18 +663,22 @@ int fthd_isp_cmd_channel_info(struct fthd_private *dev_priv)
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	len = sizeof(cmd);
+ 	ret = fthd_isp_cmd(dev_priv, CISP_CMD_CH_INFO_GET, &cmd, sizeof(cmd), &len);
+-	print_hex_dump_bytes("CHINFO ", DUMP_PREFIX_OFFSET, &cmd, sizeof(cmd));
+-	pr_debug("sensor id: %04x %04x\n", cmd.sensorid0, cmd.sensorid1);
+-	pr_debug("sensor count: %d\n", cmd.sensor_count);
+-	pr_debug("camera module serial number string: %s\n", cmd.camera_module_serial_number);
+-	pr_debug("sensor serial number: %02X%02X%02X%02X%02X%02X%02X%02X\n",
+-		 cmd.sensor_serial_number[0], cmd.sensor_serial_number[1],
+-		 cmd.sensor_serial_number[2], cmd.sensor_serial_number[3],
+-		 cmd.sensor_serial_number[4], cmd.sensor_serial_number[5],
+-		 cmd.sensor_serial_number[6], cmd.sensor_serial_number[7]);
++	dev_info(&dev_priv->pdev->dev,
++		 "CH_INFO_GET ret=%d len=%d sensor ids %04x/%04x count=%u\n",
++		 ret, len, cmd.sensorid0, cmd.sensorid1, cmd.sensor_count);
++	print_hex_dump(KERN_INFO, "facetimehd CHINFO ", DUMP_PREFIX_OFFSET,
++		       16, 1, &cmd, sizeof(cmd), false);
++	if (ret)
++		return ret;
++
+ 	dev_priv->sensor_id0 = cmd.sensorid0;
+ 	dev_priv->sensor_id1 = cmd.sensorid1;
+ 	dev_priv->sensor_count = cmd.sensor_count;
++
++	if (dev_priv->sensor_count == 0)
++		dev_warn(&dev_priv->pdev->dev,
++			 "Firmware reported zero camera sensors; stream may fail\n");
++
+ 	return ret;
+ }
+ 
+@@ -1115,16 +1182,21 @@ int fthd_start_channel(struct fthd_private *dev_priv, int channel)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (dev_priv->fmt.fmt.width < 1280 ||
+-	    dev_priv->fmt.fmt.height < 720) {
+-		x1 = 160;
+-		x2 = 960;
++	if (dev_priv->fmt.fmt.width < 640 ||
++	    dev_priv->fmt.fmt.height < 480) {
++		x1 = 80;
++		x2 = 480;
+ 	} else {
+ 		x1 = 0;
+-		x2 = 1280;
++		x2 = 640;
+ 	}
+ 
+-	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x1, 0, x2, 720);
++	dev_info(&dev_priv->pdev->dev,
++		 "Starting channel %d: requested %ux%u, crop [%d,0][%d,480]\n",
++		 channel, dev_priv->fmt.fmt.width, dev_priv->fmt.fmt.height,
++		 x1, x2);
++
++	ret = fthd_isp_cmd_channel_crop_set(dev_priv, 0, x1, 0, x2, 480);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1262,13 +1334,17 @@ int isp_init(struct fthd_private *dev_priv)
+ 	if (ret)
+ 		return ret;
+ 
+-	isp_acpi_set_power(dev_priv, 1);
+-	mdelay(20);
++	/* Power on the sensor and set PCIe link.
++	 * isp_enable_sensor now handles ACPI CMPE + delays + PCI D0.
++	 * We keep the mdelay here for safety on older kernels,
++	 * but the real work is in isp_enable_sensor. */
++	isp_enable_sensor(dev_priv);
+ 
+-	pci_set_power_state(dev_priv->pdev, PCI_D0);
+-	mdelay(10);
++	/* Additional delay after sensor enable for firmware to settle.
++	 * On some MacBooks the firmware needs extra time before the
++	 * first IPC command. */
++	mdelay(20);
+ 
+-	isp_enable_sensor(dev_priv);
+ 	FTHD_ISP_REG_WRITE(0, ISP_FW_CHAN_CTRL);
+ 	FTHD_ISP_REG_WRITE(0, ISP_FW_QUEUE_CTRL);
+ 	FTHD_ISP_REG_WRITE(0, ISP_FW_SIZE);
+diff --git a/fthd_v4l2.c b/fthd_v4l2.c
+index f8b75aa..b2b2275 100644
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -25,8 +25,8 @@
+ #include "fthd_ringbuf.h"
+ #include "fthd_buffer.h"
+ 
+-#define FTHD_MAX_WIDTH 1280
+-#define FTHD_MAX_HEIGHT 720
++#define FTHD_MAX_WIDTH 640
++#define FTHD_MAX_HEIGHT 480
+ #define FTHD_MIN_WIDTH 320
+ #define FTHD_MIN_HEIGHT 240
+ #define FTHD_NUM_FORMATS 2 /* NV16 is disabled for now */
+@@ -742,10 +742,10 @@ int fthd_v4l2_register(struct fthd_private *dev_priv)
+ 		video_device_release(vdev);
+ 		goto fail_vdev;
+ 	}
+-	dev_priv->fmt.fmt.sizeimage = 1280 * 720 * 2;
++	dev_priv->fmt.fmt.sizeimage = 640 * 480 * 2;
+ 	dev_priv->fmt.fmt.pixelformat = V4L2_PIX_FMT_YUYV;
+-	dev_priv->fmt.fmt.width = 1280;
+-	dev_priv->fmt.fmt.height = 720;
++	dev_priv->fmt.fmt.width = 640;
++	dev_priv->fmt.fmt.height = 480;
+ 	dev_priv->fmt.planes = 1;
+ 
+ 	fthd_v4l2_adjust_format(dev_priv, &dev_priv->fmt.fmt);

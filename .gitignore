@@ -1,0 +1,19 @@
+# Do not commit Apple firmware or local extraction artifacts
+firmware.bin
+*_01XX.dat
+AppleCamera.sys
+AppleCamera64.exe
+BootCampESD.pkg
+WindowsSupport.dmg
+Payload~
+
+# Local build/research leftovers
+*.raw
+*.ppm
+*.ko
+*.ko.zst
+*.o
+*.mod
+*.cmd
+.cache/
+build/

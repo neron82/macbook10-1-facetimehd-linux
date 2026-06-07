@@ -1,0 +1,7 @@
+This repository contains documentation, helper scripts, and patches for the GPL-licensed patjak/facetimehd Linux driver.
+
+The patch files are intended to be used with the upstream facetimehd driver and should be treated as GPL-2.0-only unless the upstream project states otherwise.
+
+Documentation in this repository may be used under CC0-1.0.
+
+No Apple firmware, calibration files, or other proprietary Apple binaries are included or licensed by this repository.
