@@ -59,6 +59,12 @@ The fix appears to require all of these pieces together:
    - Failed firmware experiments can wedge the ISP until reboot/cold reset.
    - If a known-good combination suddenly reports `No wake signal`, stop cycling patches and reboot before drawing conclusions.
 
+## Upstream tracking
+
+Upstream issue opened at `patjak/facetimehd`:
+
+- https://github.com/patjak/facetimehd/issues/326
+
 ## Repository layout
 
 - `patches/0001-macbook10-1-facetimehd-480p-fw155-support.patch` — current working patch against `patjak/facetimehd`.
