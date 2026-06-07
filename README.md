@@ -114,3 +114,9 @@ Size Image        : 614400
 ## Status
 
 This is a working field fix for one verified MacBook10,1. It should be treated as a reproducible hardware-specific fix and upstream lead, not yet a polished generic upstream patch for all FaceTimeHD devices.
+
+## Related MacBook10,1 hardware fix
+
+The same machine also has a verified internal microphone fix documented here:
+
+- https://github.com/neron82/macbook10-1-internal-mic-linux
